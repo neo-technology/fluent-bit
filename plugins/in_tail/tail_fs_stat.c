@@ -127,6 +127,7 @@ static int tail_fs_check(struct flb_input_instance *ins,
                 flb_tail_db_file_delete(file, ctx);
             }
 #endif
+            flb_tail_file_abandoned(file, &st);
             flb_tail_file_remove(file);
             continue;
         }
