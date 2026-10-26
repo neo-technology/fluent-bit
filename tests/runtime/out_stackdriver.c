@@ -23,8 +23,26 @@
 #include <fluent-bit/flb_ra_key.h>
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_compat.h>
+#include <fluent-bit/flb_output.h>
+#include <cmetrics/cmt_counter.h>
 
 #include "flb_tests_runtime.h"
+
+#if !defined(FLB_SYSTEM_WINDOWS) && defined(FLB_HAVE_OPENSSL)
+#define STACKDRIVER_HTTP_MOCK_ENABLED
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <openssl/ssl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+#endif
 
 /* Local 'test' credentials file */
 #define SERVICE_CREDENTIALS \
@@ -6734,6 +6752,710 @@ void flb_test_non_scalar_payload_with_residual_fields()
     flb_destroy(ctx);
 }
 
+#ifdef STACKDRIVER_HTTP_MOCK_ENABLED
+
+#define STACKDRIVER_MOCK_BUFFER_SIZE        8192
+#define STACKDRIVER_MOCK_PATH_SIZE          256
+#define STACKDRIVER_MOCK_IO_TIMEOUT_SEC     5
+#define STACKDRIVER_MOCK_POLL_MS            50
+#define STACKDRIVER_MOCK_WAIT_MS            20000
+#define STACKDRIVER_MOCK_RECORDS \
+    "[1595349600,{\"message\":\"one\"}]\n" \
+    "[1595349600,{\"message\":\"two\"}]\n" \
+    "[1595349600,{\"message\":\"three\"}]\n"
+#define STACKDRIVER_MOCK_RECORD_COUNT       3
+#define STACKDRIVER_MOCK_CERTIFICATE        FLB_TESTS_DATA_PATH "/data/tls/certificate.pem"
+#define STACKDRIVER_MOCK_PRIVATE_KEY        FLB_TESTS_DATA_PATH "/data/tls/private_key.pem"
+#define STACKDRIVER_MOCK_PROJECT_ID_PATH    "/computeMetadata/v1/project/project-id"
+#define STACKDRIVER_MOCK_ZONE_PATH          "/computeMetadata/v1/instance/zone"
+#define STACKDRIVER_MOCK_INSTANCE_ID_PATH   "/computeMetadata/v1/instance/id"
+#define STACKDRIVER_MOCK_TOKEN_PATH_PREFIX  "/computeMetadata/v1/instance/service-accounts/"
+#define STACKDRIVER_MOCK_TOKEN_BODY \
+    "{\"access_token\":\"stackdriver-test-token\",\"expires_in\":3600,\"token_type\":\"Bearer\"}"
+#define STACKDRIVER_MOCK_BODY_OK            "{}"
+#define STACKDRIVER_MOCK_BODY_UNAVAILABLE \
+    "{\"error\":{\"code\":503,\"message\":\"unavailable\",\"status\":\"UNAVAILABLE\"}}"
+#define STACKDRIVER_MOCK_BODY_TIMEOUT \
+    "{\"error\":{\"code\":408,\"message\":\"timeout\",\"status\":\"DEADLINE_EXCEEDED\"}}"
+#define STACKDRIVER_MOCK_BODY_QUOTA \
+    "{\"error\":{\"code\":429,\"message\":\"quota\",\"status\":\"RESOURCE_EXHAUSTED\"}}"
+#define STACKDRIVER_MOCK_BODY_DENIED \
+    "{\"error\":{\"code\":403,\"message\":\"denied\",\"status\":\"PERMISSION_DENIED\"}}"
+#define STACKDRIVER_MOCK_BODY_INVALID \
+    "{\"error\":{\"code\":400,\"message\":\"invalid\",\"status\":\"INVALID_ARGUMENT\"}}"
+#define STACKDRIVER_MOCK_PARTIAL_ERRORS_TYPE \
+    "{\"@type\":\"type.googleapis.com/google.logging.v2.WriteLogEntriesPartialErrors\","
+#define STACKDRIVER_MOCK_BODY_PARTIAL_ONE_REJECTED \
+    "{\"error\":{\"code\":400,\"message\":\"partial\",\"status\":\"INVALID_ARGUMENT\",\"details\":[" \
+    STACKDRIVER_MOCK_PARTIAL_ERRORS_TYPE \
+    "\"logEntryErrors\":{\"1\":{\"code\":3,\"message\":\"invalid\"}}}]}}"
+#define STACKDRIVER_MOCK_BODY_PARTIAL_ALL_REJECTED \
+    "{\"error\":{\"code\":400,\"message\":\"partial\",\"status\":\"INVALID_ARGUMENT\",\"details\":[" \
+    STACKDRIVER_MOCK_PARTIAL_ERRORS_TYPE \
+    "\"logEntryErrors\":{\"0\":{\"code\":3,\"message\":\"invalid\"}," \
+    "\"1\":{\"code\":3,\"message\":\"invalid\"}," \
+    "\"2\":{\"code\":3,\"message\":\"invalid\"}}}]}}"
+
+enum stackdriver_mock_mode {
+    STACKDRIVER_MOCK_METADATA,
+    STACKDRIVER_MOCK_LOGGING
+};
+
+struct stackdriver_mock_reply {
+    int status;
+    const char *reason;
+    const char *body;
+};
+
+struct stackdriver_mock_server {
+    enum stackdriver_mock_mode mode;
+    const struct stackdriver_mock_reply *replies;
+    int reply_count;
+    int requests;
+    int listen_fd;
+    int port;
+    int thread_started;
+    volatile int stop;
+    SSL_CTX *ssl_ctx;
+    pthread_t thread;
+};
+
+struct stackdriver_http_counters {
+    double dropped;
+    double proc;
+    double retries;
+    double retried;
+    double retries_failed;
+    double errors;
+};
+
+struct stackdriver_http_case {
+    const struct stackdriver_mock_reply *replies;
+    int reply_count;
+    struct stackdriver_http_counters expected;
+};
+
+static ssize_t stackdriver_mock_recv(SSL *ssl, int fd, char *buf, size_t size)
+{
+    if (ssl != NULL) {
+        return SSL_read(ssl, buf, (int) size);
+    }
+
+    return recv(fd, buf, size, 0);
+}
+
+static void stackdriver_mock_send(SSL *ssl, int fd, const char *buf, size_t size)
+{
+    if (ssl != NULL) {
+        SSL_write(ssl, buf, (int) size);
+    }
+    else {
+        send(fd, buf, size, 0);
+    }
+}
+
+static size_t stackdriver_mock_content_length(const char *headers)
+{
+    const char *line;
+
+    line = headers;
+    while (line[0] != '\0' && line[0] != '\r') {
+        if (strncasecmp(line, "Content-Length:", 15) == 0) {
+            return (size_t) strtoul(line + 15, NULL, 10);
+        }
+
+        line = strstr(line, "\r\n");
+        if (line == NULL) {
+            break;
+        }
+        line += 2;
+    }
+
+    return 0;
+}
+
+static int stackdriver_mock_read_request(SSL *ssl, int fd, char *buf, size_t size)
+{
+    char *header_end;
+    size_t total;
+    size_t expected;
+    ssize_t received;
+
+    header_end = NULL;
+    total = 0;
+    expected = 0;
+
+    while (total < size - 1) {
+        received = stackdriver_mock_recv(ssl, fd, buf + total, size - 1 - total);
+        if (received <= 0) {
+            return FLB_FALSE;
+        }
+
+        total += (size_t) received;
+        buf[total] = '\0';
+
+        if (header_end == NULL) {
+            header_end = strstr(buf, "\r\n\r\n");
+            if (header_end != NULL) {
+                expected = (size_t) (header_end - buf) + 4 +
+                           stackdriver_mock_content_length(buf);
+            }
+        }
+
+        if (header_end != NULL && total >= expected) {
+            return FLB_TRUE;
+        }
+    }
+
+    return FLB_FALSE;
+}
+
+static void stackdriver_mock_respond(SSL *ssl, int fd, int status,
+                                     const char *reason, const char *body)
+{
+    char response[STACKDRIVER_MOCK_BUFFER_SIZE];
+    int length;
+
+    length = snprintf(response, sizeof(response),
+                      "HTTP/1.1 %d %s\r\n"
+                      "Content-Type: application/json\r\n"
+                      "Content-Length: %zu\r\n"
+                      "Connection: close\r\n"
+                      "\r\n"
+                      "%s",
+                      status, reason, strlen(body), body);
+    if (length > 0 && (size_t) length < sizeof(response)) {
+        stackdriver_mock_send(ssl, fd, response, (size_t) length);
+    }
+}
+
+static void stackdriver_mock_serve_metadata(SSL *ssl, int fd, const char *path)
+{
+    if (strcmp(path, STACKDRIVER_MOCK_PROJECT_ID_PATH) == 0) {
+        stackdriver_mock_respond(ssl, fd, 200, "OK", "fluent-bit-test");
+    }
+    else if (strcmp(path, STACKDRIVER_MOCK_ZONE_PATH) == 0) {
+        stackdriver_mock_respond(ssl, fd, 200, "OK",
+                                 "projects/123456789/zones/us-central1-a");
+    }
+    else if (strcmp(path, STACKDRIVER_MOCK_INSTANCE_ID_PATH) == 0) {
+        stackdriver_mock_respond(ssl, fd, 200, "OK", "1234567890");
+    }
+    else if (strncmp(path, STACKDRIVER_MOCK_TOKEN_PATH_PREFIX,
+                     strlen(STACKDRIVER_MOCK_TOKEN_PATH_PREFIX)) == 0 &&
+             strstr(path, "/token") != NULL) {
+        stackdriver_mock_respond(ssl, fd, 200, "OK", STACKDRIVER_MOCK_TOKEN_BODY);
+    }
+    else {
+        stackdriver_mock_respond(ssl, fd, 404, "Not Found", "{}");
+    }
+}
+
+static void stackdriver_mock_close_connection(SSL *ssl, int fd)
+{
+    if (ssl != NULL) {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+    }
+
+    close(fd);
+}
+
+static void stackdriver_mock_handle(struct stackdriver_mock_server *server, int fd)
+{
+    char request[STACKDRIVER_MOCK_BUFFER_SIZE];
+    char path[STACKDRIVER_MOCK_PATH_SIZE];
+    const struct stackdriver_mock_reply *reply;
+    struct timeval timeout;
+    SSL *ssl;
+    int index;
+
+    timeout.tv_sec = STACKDRIVER_MOCK_IO_TIMEOUT_SEC;
+    timeout.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    ssl = NULL;
+    if (server->mode == STACKDRIVER_MOCK_LOGGING) {
+        ssl = SSL_new(server->ssl_ctx);
+        if (ssl == NULL) {
+            close(fd);
+            return;
+        }
+
+        SSL_set_fd(ssl, fd);
+        if (SSL_accept(ssl) <= 0) {
+            stackdriver_mock_close_connection(ssl, fd);
+            return;
+        }
+    }
+
+    if (stackdriver_mock_read_request(ssl, fd, request, sizeof(request)) != FLB_TRUE) {
+        stackdriver_mock_close_connection(ssl, fd);
+        return;
+    }
+
+    path[0] = '\0';
+    sscanf(request, "%*s %255s", path);
+
+    if (server->mode == STACKDRIVER_MOCK_METADATA) {
+        stackdriver_mock_serve_metadata(ssl, fd, path);
+    }
+    else {
+        index = server->requests;
+        if (index >= server->reply_count) {
+            index = server->reply_count - 1;
+        }
+        reply = &server->replies[index];
+        server->requests++;
+        stackdriver_mock_respond(ssl, fd, reply->status, reply->reason, reply->body);
+    }
+
+    stackdriver_mock_close_connection(ssl, fd);
+}
+
+static void *stackdriver_mock_thread(void *arg)
+{
+    struct stackdriver_mock_server *server;
+    struct pollfd pfd;
+    int fd;
+
+    server = (struct stackdriver_mock_server *) arg;
+
+    while (server->stop == FLB_FALSE) {
+        pfd.fd = server->listen_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+
+        if (poll(&pfd, 1, STACKDRIVER_MOCK_POLL_MS) <= 0) {
+            continue;
+        }
+
+        fd = accept(server->listen_fd, NULL, NULL);
+        if (fd >= 0) {
+            stackdriver_mock_handle(server, fd);
+        }
+    }
+
+    return NULL;
+}
+
+static void stackdriver_mock_init(struct stackdriver_mock_server *server,
+                                  enum stackdriver_mock_mode mode,
+                                  const struct stackdriver_mock_reply *replies,
+                                  int reply_count)
+{
+    memset(server, 0, sizeof(*server));
+    server->mode = mode;
+    server->replies = replies;
+    server->reply_count = reply_count;
+    server->listen_fd = -1;
+}
+
+static void stackdriver_mock_stop(struct stackdriver_mock_server *server)
+{
+    if (server->thread_started == FLB_TRUE) {
+        server->stop = FLB_TRUE;
+        pthread_join(server->thread, NULL);
+        server->thread_started = FLB_FALSE;
+    }
+
+    if (server->listen_fd >= 0) {
+        close(server->listen_fd);
+        server->listen_fd = -1;
+    }
+
+    if (server->ssl_ctx != NULL) {
+        SSL_CTX_free(server->ssl_ctx);
+        server->ssl_ctx = NULL;
+    }
+}
+
+static int stackdriver_mock_start(struct stackdriver_mock_server *server)
+{
+    struct sockaddr_in addr;
+    socklen_t addr_len;
+    int one;
+
+    signal(SIGPIPE, SIG_IGN);
+
+    server->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server->listen_fd < 0) {
+        return -1;
+    }
+
+    one = 1;
+    setsockopt(server->listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+
+    if (bind(server->listen_fd, (struct sockaddr *) &addr, sizeof(addr)) != 0 ||
+        listen(server->listen_fd, 4) != 0) {
+        stackdriver_mock_stop(server);
+        return -1;
+    }
+
+    addr_len = sizeof(addr);
+    if (getsockname(server->listen_fd, (struct sockaddr *) &addr, &addr_len) != 0) {
+        stackdriver_mock_stop(server);
+        return -1;
+    }
+    server->port = ntohs(addr.sin_port);
+
+    if (server->mode == STACKDRIVER_MOCK_LOGGING) {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+        server->ssl_ctx = SSL_CTX_new(SSLv23_server_method());
+#else
+        server->ssl_ctx = SSL_CTX_new(TLS_server_method());
+#endif
+        if (server->ssl_ctx == NULL ||
+            SSL_CTX_use_certificate_file(server->ssl_ctx, STACKDRIVER_MOCK_CERTIFICATE,
+                                         SSL_FILETYPE_PEM) != 1 ||
+            SSL_CTX_use_PrivateKey_file(server->ssl_ctx, STACKDRIVER_MOCK_PRIVATE_KEY,
+                                        SSL_FILETYPE_PEM) != 1) {
+            stackdriver_mock_stop(server);
+            return -1;
+        }
+    }
+
+    if (pthread_create(&server->thread, NULL, stackdriver_mock_thread, server) != 0) {
+        stackdriver_mock_stop(server);
+        return -1;
+    }
+    server->thread_started = FLB_TRUE;
+
+    return 0;
+}
+
+static double stackdriver_counter_value(struct cmt_counter *counter, const char *name)
+{
+    char *labels[1];
+    double value;
+
+    if (counter == NULL) {
+        return 0.0;
+    }
+
+    labels[0] = (char *) name;
+    value = 0.0;
+    if (cmt_counter_get_val(counter, 1, labels, &value) != 0) {
+        return 0.0;
+    }
+
+    return value;
+}
+
+static void stackdriver_read_counters(struct flb_output_instance *o_ins,
+                                      struct stackdriver_http_counters *counters)
+{
+    const char *name;
+
+    name = flb_output_name(o_ins);
+    counters->dropped = stackdriver_counter_value(o_ins->cmt_dropped_records, name);
+    counters->proc = stackdriver_counter_value(o_ins->cmt_proc_records, name);
+    counters->retries = stackdriver_counter_value(o_ins->cmt_retries, name);
+    counters->retried = stackdriver_counter_value(o_ins->cmt_retried_records, name);
+    counters->retries_failed = stackdriver_counter_value(o_ins->cmt_retries_failed, name);
+    counters->errors = stackdriver_counter_value(o_ins->cmt_errors, name);
+}
+
+static int stackdriver_counters_match(const struct stackdriver_http_counters *actual,
+                                      const struct stackdriver_http_counters *expected)
+{
+    return actual->dropped == expected->dropped &&
+           actual->proc == expected->proc &&
+           actual->retries == expected->retries &&
+           actual->retried == expected->retried &&
+           actual->retries_failed == expected->retries_failed &&
+           actual->errors == expected->errors;
+}
+
+static void stackdriver_check_counter(const char *name, double expected, double actual)
+{
+    TEST_CHECK_(expected == actual, "%s: expected %.0f, got %.0f",
+                name, expected, actual);
+}
+
+static struct flb_output_instance *stackdriver_find_output(flb_ctx_t *ctx)
+{
+    struct mk_list *head;
+    struct flb_output_instance *o_ins;
+
+    mk_list_foreach(head, &ctx->config->outputs) {
+        o_ins = mk_list_entry(head, struct flb_output_instance, _head);
+        if (strcmp(o_ins->p->name, "stackdriver") == 0) {
+            return o_ins;
+        }
+    }
+
+    return NULL;
+}
+
+static void stackdriver_http_pipeline(const struct stackdriver_http_case *tc,
+                                      const struct stackdriver_mock_server *metadata,
+                                      const struct stackdriver_mock_server *logging)
+{
+    int ret;
+    int in_ffd;
+    int out_ffd;
+    int waited;
+    char metadata_url[64];
+    char logging_url[64];
+    flb_ctx_t *ctx;
+    struct flb_output_instance *o_ins;
+    struct stackdriver_http_counters actual;
+
+    snprintf(metadata_url, sizeof(metadata_url), "http://127.0.0.1:%d", metadata->port);
+    snprintf(logging_url, sizeof(logging_url), "https://127.0.0.1:%d", logging->port);
+
+    ctx = flb_create();
+    flb_service_set(ctx, "flush", "0.2", "grace", "1",
+                    "scheduler.base", "1", "scheduler.cap", "1", NULL);
+
+    in_ffd = flb_input(ctx, (char *) "lib", NULL);
+    flb_input_set(ctx, in_ffd, "tag", "test", NULL);
+
+    out_ffd = flb_output(ctx, (char *) "stackdriver", NULL);
+    flb_output_set(ctx, out_ffd,
+                   "match", "test",
+                   "resource", "global",
+                   "metadata_server", metadata_url,
+                   "cloud_logging_base_url", logging_url,
+                   "tls", "on",
+                   "tls.verify", "off",
+                   "retry_limit", "1",
+                   NULL);
+
+    ret = flb_start(ctx);
+    TEST_CHECK(ret == 0);
+    if (ret != 0) {
+        flb_destroy(ctx);
+        return;
+    }
+
+    flb_lib_push(ctx, in_ffd, (char *) STACKDRIVER_MOCK_RECORDS,
+                 sizeof(STACKDRIVER_MOCK_RECORDS) - 1);
+
+    o_ins = stackdriver_find_output(ctx);
+    TEST_CHECK(o_ins != NULL);
+
+    if (o_ins != NULL) {
+        for (waited = 0; waited < STACKDRIVER_MOCK_WAIT_MS;
+             waited += STACKDRIVER_MOCK_POLL_MS) {
+            stackdriver_read_counters(o_ins, &actual);
+            if (stackdriver_counters_match(&actual, &tc->expected)) {
+                break;
+            }
+            flb_time_msleep(STACKDRIVER_MOCK_POLL_MS);
+        }
+
+        stackdriver_read_counters(o_ins, &actual);
+        stackdriver_check_counter("dropped", tc->expected.dropped, actual.dropped);
+        stackdriver_check_counter("proc", tc->expected.proc, actual.proc);
+        stackdriver_check_counter("retries", tc->expected.retries, actual.retries);
+        stackdriver_check_counter("retried", tc->expected.retried, actual.retried);
+        stackdriver_check_counter("retries_failed", tc->expected.retries_failed,
+                                  actual.retries_failed);
+        stackdriver_check_counter("errors", tc->expected.errors, actual.errors);
+    }
+
+    flb_stop(ctx);
+    flb_destroy(ctx);
+}
+
+static void stackdriver_http_run(const struct stackdriver_http_case *tc)
+{
+    int ret;
+    struct stackdriver_mock_server metadata;
+    struct stackdriver_mock_server logging;
+
+    stackdriver_mock_init(&metadata, STACKDRIVER_MOCK_METADATA, NULL, 0);
+    stackdriver_mock_init(&logging, STACKDRIVER_MOCK_LOGGING,
+                          tc->replies, tc->reply_count);
+
+    ret = stackdriver_mock_start(&metadata);
+    if (ret == 0) {
+        ret = stackdriver_mock_start(&logging);
+    }
+    TEST_CHECK(ret == 0);
+
+    if (ret == 0) {
+        stackdriver_http_pipeline(tc, &metadata, &logging);
+        stackdriver_mock_stop(&logging);
+        TEST_CHECK_(logging.requests == tc->reply_count,
+                    "logging requests: expected %d, got %d",
+                    tc->reply_count, logging.requests);
+    }
+
+    stackdriver_mock_stop(&metadata);
+}
+
+void flb_test_stackdriver_http_success(void)
+{
+    static const struct stackdriver_mock_reply replies[] = {
+        {200, "OK", STACKDRIVER_MOCK_BODY_OK},
+    };
+    struct stackdriver_http_case tc = {
+        .replies = replies,
+        .reply_count = sizeof(replies) / sizeof(replies[0]),
+        .expected = {.proc = STACKDRIVER_MOCK_RECORD_COUNT},
+    };
+
+    stackdriver_http_run(&tc);
+}
+
+void flb_test_stackdriver_http_5xx_retry_recovers(void)
+{
+    static const struct stackdriver_mock_reply replies[] = {
+        {503, "Service Unavailable", STACKDRIVER_MOCK_BODY_UNAVAILABLE},
+        {200, "OK", STACKDRIVER_MOCK_BODY_OK},
+    };
+    struct stackdriver_http_case tc = {
+        .replies = replies,
+        .reply_count = sizeof(replies) / sizeof(replies[0]),
+        .expected = {
+            .proc = STACKDRIVER_MOCK_RECORD_COUNT,
+            .retries = 1,
+            .retried = STACKDRIVER_MOCK_RECORD_COUNT,
+        },
+    };
+
+    stackdriver_http_run(&tc);
+}
+
+void flb_test_stackdriver_http_5xx_retry_exhausted(void)
+{
+    static const struct stackdriver_mock_reply replies[] = {
+        {503, "Service Unavailable", STACKDRIVER_MOCK_BODY_UNAVAILABLE},
+        {503, "Service Unavailable", STACKDRIVER_MOCK_BODY_UNAVAILABLE},
+    };
+    struct stackdriver_http_case tc = {
+        .replies = replies,
+        .reply_count = sizeof(replies) / sizeof(replies[0]),
+        .expected = {
+            .dropped = STACKDRIVER_MOCK_RECORD_COUNT,
+            .retries = 1,
+            .retried = STACKDRIVER_MOCK_RECORD_COUNT,
+            .retries_failed = 1,
+        },
+    };
+
+    stackdriver_http_run(&tc);
+}
+
+void flb_test_stackdriver_http_429_retry_recovers(void)
+{
+    static const struct stackdriver_mock_reply replies[] = {
+        {429, "Too Many Requests", STACKDRIVER_MOCK_BODY_QUOTA},
+        {200, "OK", STACKDRIVER_MOCK_BODY_OK},
+    };
+    struct stackdriver_http_case tc = {
+        .replies = replies,
+        .reply_count = sizeof(replies) / sizeof(replies[0]),
+        .expected = {
+            .proc = STACKDRIVER_MOCK_RECORD_COUNT,
+            .retries = 1,
+            .retried = STACKDRIVER_MOCK_RECORD_COUNT,
+        },
+    };
+
+    stackdriver_http_run(&tc);
+}
+
+void flb_test_stackdriver_http_408_retry_recovers(void)
+{
+    static const struct stackdriver_mock_reply replies[] = {
+        {408, "Request Timeout", STACKDRIVER_MOCK_BODY_TIMEOUT},
+        {200, "OK", STACKDRIVER_MOCK_BODY_OK},
+    };
+    struct stackdriver_http_case tc = {
+        .replies = replies,
+        .reply_count = sizeof(replies) / sizeof(replies[0]),
+        .expected = {
+            .proc = STACKDRIVER_MOCK_RECORD_COUNT,
+            .retries = 1,
+            .retried = STACKDRIVER_MOCK_RECORD_COUNT,
+        },
+    };
+
+    stackdriver_http_run(&tc);
+}
+
+void flb_test_stackdriver_http_403_terminal_error(void)
+{
+    static const struct stackdriver_mock_reply replies[] = {
+        {403, "Forbidden", STACKDRIVER_MOCK_BODY_DENIED},
+    };
+    struct stackdriver_http_case tc = {
+        .replies = replies,
+        .reply_count = sizeof(replies) / sizeof(replies[0]),
+        .expected = {
+            .dropped = STACKDRIVER_MOCK_RECORD_COUNT,
+            .errors = 1,
+        },
+    };
+
+    stackdriver_http_run(&tc);
+}
+
+void flb_test_stackdriver_http_400_without_details_error(void)
+{
+    static const struct stackdriver_mock_reply replies[] = {
+        {400, "Bad Request", STACKDRIVER_MOCK_BODY_INVALID},
+    };
+    struct stackdriver_http_case tc = {
+        .replies = replies,
+        .reply_count = sizeof(replies) / sizeof(replies[0]),
+        .expected = {
+            .dropped = STACKDRIVER_MOCK_RECORD_COUNT,
+            .errors = 1,
+        },
+    };
+
+    stackdriver_http_run(&tc);
+}
+
+void flb_test_stackdriver_http_partial_success_counts_rejected(void)
+{
+    static const struct stackdriver_mock_reply replies[] = {
+        {400, "Bad Request", STACKDRIVER_MOCK_BODY_PARTIAL_ONE_REJECTED},
+    };
+    struct stackdriver_http_case tc = {
+        .replies = replies,
+        .reply_count = sizeof(replies) / sizeof(replies[0]),
+        .expected = {
+            .dropped = 1,
+            /* Partial success returns FLB_OK, so the engine counts the whole chunk as processed */
+            .proc = STACKDRIVER_MOCK_RECORD_COUNT,
+        },
+    };
+
+    stackdriver_http_run(&tc);
+}
+
+void flb_test_stackdriver_http_partial_success_all_rejected(void)
+{
+    static const struct stackdriver_mock_reply replies[] = {
+        {400, "Bad Request", STACKDRIVER_MOCK_BODY_PARTIAL_ALL_REJECTED},
+    };
+    struct stackdriver_http_case tc = {
+        .replies = replies,
+        .reply_count = sizeof(replies) / sizeof(replies[0]),
+        .expected = {
+            .dropped = STACKDRIVER_MOCK_RECORD_COUNT,
+            /* Still FLB_OK, so the engine counts the chunk as processed */
+            .proc = STACKDRIVER_MOCK_RECORD_COUNT,
+        },
+    };
+
+    stackdriver_http_run(&tc);
+}
+
+#endif
+
 /* Test list */
 TEST_LIST = {
     {"severity_multi_entries", flb_test_multi_entries_severity },
@@ -6871,5 +7593,18 @@ TEST_LIST = {
     {"string_text_payload_with_mismatched_text_payload_key", flb_test_string_text_payload_with_mismatched_text_payload_key},
     {"string_text_payload_with_residual_fields", flb_test_string_text_payload_with_residual_fields},
     {"non_scalar_payload_with_residual_fields", flb_test_non_scalar_payload_with_residual_fields},
+
+#ifdef STACKDRIVER_HTTP_MOCK_ENABLED
+    {"stackdriver_http_success", flb_test_stackdriver_http_success},
+    {"stackdriver_http_5xx_retry_recovers", flb_test_stackdriver_http_5xx_retry_recovers},
+    {"stackdriver_http_5xx_retry_exhausted", flb_test_stackdriver_http_5xx_retry_exhausted},
+    {"stackdriver_http_429_retry_recovers", flb_test_stackdriver_http_429_retry_recovers},
+    {"stackdriver_http_408_retry_recovers", flb_test_stackdriver_http_408_retry_recovers},
+    {"stackdriver_http_403_terminal_error", flb_test_stackdriver_http_403_terminal_error},
+    {"stackdriver_http_400_without_details_error", flb_test_stackdriver_http_400_without_details_error},
+    {"stackdriver_http_partial_success_counts_rejected", flb_test_stackdriver_http_partial_success_counts_rejected},
+    {"stackdriver_http_partial_success_all_rejected", flb_test_stackdriver_http_partial_success_all_rejected},
+#endif
+
     {NULL, NULL}
 };
