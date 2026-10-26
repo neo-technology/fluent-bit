@@ -2811,8 +2811,10 @@ static int parse_partial_success_response(struct flb_http_client* c,
     int ret;
     int root_type;
     int i;
+    int j;
     int log_entry_ret;
     int code_ret;
+    int partial_success_found = FLB_FALSE;
     char* buffer;
     char at_type_str[PARTIAL_SUCCESS_GRPC_TYPE_SIZE];
     size_t size;
@@ -2916,12 +2918,13 @@ static int parse_partial_success_response(struct flb_http_client* c,
                                                    "@type", 5,
                                                    MSGPACK_OBJECT_STR,
                                                    &at_type);
+        if (ret != 0 || at_type.via.str.size != PARTIAL_SUCCESS_GRPC_TYPE_SIZE) {
+            continue;
+        }
         strncpy(at_type_str, at_type.via.str.ptr,
                 PARTIAL_SUCCESS_GRPC_TYPE_SIZE);
-        if (ret != 0 ||
-            at_type.via.str.size != PARTIAL_SUCCESS_GRPC_TYPE_SIZE ||
-            strncmp(at_type_str, PARTIAL_SUCCESS_GRPC_TYPE,
-                           PARTIAL_SUCCESS_GRPC_TYPE_SIZE) != 0) {
+        if (strncmp(at_type_str, PARTIAL_SUCCESS_GRPC_TYPE,
+                    PARTIAL_SUCCESS_GRPC_TYPE_SIZE) != 0) {
             continue;
         }
 
@@ -2932,9 +2935,10 @@ static int parse_partial_success_response(struct flb_http_client* c,
         if (ret != 0) {
             continue;
         }
+        partial_success_found = FLB_TRUE;
 
-        for (i = 0; i < logEntryErrors_map.via.map.size; i++) {
-            logEntryError_key = logEntryErrors_map.via.map.ptr[i].key;
+        for (j = 0; j < logEntryErrors_map.via.map.size; j++) {
+            logEntryError_key = logEntryErrors_map.via.map.ptr[j].key;
             if (logEntryError_key.type != MSGPACK_OBJECT_STR) {
                 continue;
             }
@@ -2975,7 +2979,7 @@ static int parse_partial_success_response(struct flb_http_client* c,
     }
     flb_free(buffer);
     msgpack_unpacked_destroy(&result);
-    return 0;
+    return partial_success_found == FLB_TRUE ? 0 : -1;
 }
 static void cb_stackdriver_flush(struct flb_event_chunk *event_chunk,
                                  struct flb_output_flush *out_flush,
@@ -2987,9 +2991,10 @@ static void cb_stackdriver_flush(struct flb_event_chunk *event_chunk,
     (void) config;
     int ret;
     int code;
-    int ret_partial_success;
+    int ret_partial_success = -1;
     int ret_code = FLB_RETRY;
     int formatted_records = 0;
+    int failed_records = 0;
     int grpc_status_counts[GRPC_STATUS_CODES_SIZE] = {0};
     size_t b_sent;
     flb_sds_t token;
@@ -3005,8 +3010,8 @@ static void cb_stackdriver_flush(struct flb_event_chunk *event_chunk,
     float write_entries_latency = 0.0;
 #ifdef FLB_HAVE_METRICS
     char *name = (char *) flb_output_name(ctx->ins);
-    uint64_t ts = cfl_time_now();
 #endif
+    uint64_t ts = cfl_time_now();
 
     /* Reformat msgpack to stackdriver JSON payload */
     payload_buf = stackdriver_format(ctx,
@@ -3119,53 +3124,48 @@ static void cb_stackdriver_flush(struct flb_event_chunk *event_chunk,
             ret_code = FLB_OK;
         }
         else {
-#ifdef FLB_HAVE_METRICS
-          /* check partial success */
-          ret_partial_success =
-                parse_partial_success_response(c,
-                                               ctx,
-                                               ts,
-                                               grpc_status_counts);
+          ret_partial_success = parse_partial_success_response(c, ctx, ts,
+                                                               grpc_status_counts);
+          if (ret_partial_success == 0) {
+            ret_code = FLB_OK;
 
-            int failed_records = 0;
-            if (ret_partial_success == 0) {
-              for (code = 0; code < GRPC_STATUS_CODES_SIZE; code++) {
-                if (grpc_status_counts[code] != 0) {
-                  failed_records += grpc_status_counts[code];
-                }
-              }
-              cmt_counter_add(ctx->ins->cmt_dropped_records, ts,
-                              failed_records, 1, (char* []) {name});
-              int successful_records =
-                  formatted_records - failed_records;
-              if (successful_records != 0) {
-                add_record_metrics(ctx, ts, successful_records, 200, 0);
-              }
+            for (code = 0; code < GRPC_STATUS_CODES_SIZE; code++) {
+              failed_records += grpc_status_counts[code];
             }
-            else {
-              add_record_metrics(ctx, ts, formatted_records,
-                                 c->resp.status, -1);
-              cmt_counter_add(ctx->ins->cmt_dropped_records, ts,
-                              formatted_records, 1,
-                              (char* []) {name});
+
+            flb_plg_warn(ctx->ins, "partial success: %d of %d records dropped",
+                         failed_records, formatted_records);
+
+#ifdef FLB_HAVE_METRICS
+            cmt_counter_add(ctx->ins->cmt_dropped_records, ts,
+                            failed_records, 1, (char* []) {name});
+            if (formatted_records != failed_records) {
+              add_record_metrics(ctx, ts, formatted_records - failed_records, 200, 0);
             }
 #endif
-          if (c->resp.status >= 400 && c->resp.status < 500) {
-            ret_code = FLB_ERROR;
-            flb_plg_warn(ctx->ins, "tag=%s error sending to Cloud Logging: %s", event_chunk->tag,
-                         c->resp.payload);
           }
           else {
-            if (c->resp.payload_size > 0) {
-              /* we got an error */
-              flb_plg_warn(ctx->ins, "tag=%s error sending to Cloud Logging: %s", event_chunk->tag,
-                           c->resp.payload);
+#ifdef FLB_HAVE_METRICS
+            add_record_metrics(ctx, ts, formatted_records, c->resp.status, -1);
+#endif
+            if (c->resp.status >= 400 && c->resp.status < 500 &&
+                c->resp.status != 429 && c->resp.status != 408) {
+              ret_code = FLB_ERROR;
+              flb_plg_warn(ctx->ins, "tag=%s error sending to Cloud Logging: %s",
+                           event_chunk->tag, c->resp.payload);
             }
             else {
-              flb_plg_debug(ctx->ins, "tag=%s response from Cloud Logging: %s", event_chunk->tag,
-                            c->resp.payload);
+              if (c->resp.payload_size > 0) {
+                /* we got an error */
+                flb_plg_warn(ctx->ins, "tag=%s error sending to Cloud Logging: %s",
+                             event_chunk->tag, c->resp.payload);
+              }
+              else {
+                flb_plg_debug(ctx->ins, "tag=%s response from Cloud Logging: %s",
+                              event_chunk->tag, c->resp.payload);
+              }
+              ret_code = FLB_RETRY;
             }
-            ret_code = FLB_RETRY;
           }
         }
     }
@@ -3177,7 +3177,9 @@ static void cb_stackdriver_flush(struct flb_event_chunk *event_chunk,
         if (write_entries_latency > 0.0) {
           cmt_histogram_observe(ctx->cmt_write_entries_latency, ts, write_entries_latency, 1, (char *[]) {name});
         }
-        add_record_metrics(ctx, ts, formatted_records, 200, 0);
+        if (ret_partial_success != 0) {
+            add_record_metrics(ctx, ts, formatted_records, 200, 0);
+        }
 
         /* OLD api */
         flb_metrics_sum(FLB_STACKDRIVER_SUCCESSFUL_REQUESTS, 1, ctx->ins->metrics);
