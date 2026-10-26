@@ -35,6 +35,7 @@ RUN mkdir -p /fluent-bit/bin /fluent-bit/etc /fluent-bit/log
 
 # hadolint ignore=DL3008
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
     build-essential \
     curl \
@@ -175,7 +176,9 @@ RUN apt-get update && \
     echo "Processing: ${package_name}"; \
     dpkg --ctrl-tarfile "$deb" | tar -Oxf - ./control > "/dpkg/var/lib/dpkg/status.d/${package_name}"; \
     dpkg --extract "$deb" /dpkg || exit 10; \
-    done
+    done && \
+    brotli_ver="$(awk '/^Version:/ {print $2}' /dpkg/var/lib/dpkg/status.d/libbrotli1)" && \
+    dpkg --compare-versions "${brotli_ver}" ge "1.1.0-2+deb13u1"
 
 # Remove unnecessary files extracted from deb packages like man pages and docs etc.
 RUN find /dpkg/ -type d -empty -delete && \
@@ -240,6 +243,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # hadolint ignore=DL3008
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
     libssl3t64 \
     libcurl4t64 \
