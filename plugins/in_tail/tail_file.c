@@ -291,6 +291,10 @@ int flb_tail_file_reset_on_truncate(struct flb_tail_file *file,
 #ifdef FLB_HAVE_METRICS
     prev_db_offset = flb_tail_file_db_offset(file);
     old_size = file->size - size_delta;
+    /* The cached size can lag behind the raw read offset, e.g. when fstat is stale. */
+    if (old_size < file->offset) {
+        old_size = file->offset;
+    }
     if (old_size > (int64_t) prev_db_offset) {
         unread_before_trunc = old_size - (int64_t) prev_db_offset;
         if (unread_before_trunc > 0) {
