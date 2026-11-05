@@ -3394,6 +3394,112 @@ void flb_test_in_tail_abandoned_bytes(void)
     test_tail_ctx_destroy(ctx);
     unlink(rotated);
 }
+
+void flb_test_in_tail_copytruncate_after_size_refresh(void)
+{
+    int ret;
+    int i;
+    ssize_t w_byte;
+    double files_processed_bytes;
+    double files_abandoned_bytes;
+    char *file = "copytruncate.log";
+    char *line1 = "{\"msg\":\"line 1\"}" NEW_LINE;
+    char *line2 = "{\"msg\":\"line 2 - longer\"}" NEW_LINE;
+    char *partial = "{\"msg\":\"partial";
+    char *line3 = "{\"msg\":\"after\"}" NEW_LINE;
+    size_t expected_processed;
+    size_t expected_abandoned;
+    struct flb_lib_out_cb cb_data;
+    struct test_tail_ctx *ctx;
+    int unused;
+
+    expected_processed = strlen(line1) + strlen(line2) + strlen(line3);
+    expected_abandoned = strlen(partial);
+    unlink(file);
+    clear_output_num();
+
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &unused;
+
+    ctx = test_tail_ctx_create(&cb_data, &file, 1, FLB_TRUE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        return;
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd,
+                        "path", file,
+                        "read_from_head", "true",
+                        "refresh_interval", "1",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd, "match", "*", NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    w_byte = write(ctx->fds[0], line1, strlen(line1));
+    TEST_CHECK(w_byte > 0);
+    w_byte = write(ctx->fds[0], line2, strlen(line2));
+    TEST_CHECK(w_byte > 0);
+    fsync(ctx->fds[0]);
+
+    for (i = 0; i < 100; i++) {
+        if (get_output_num() >= 2) {
+            break;
+        }
+        flb_time_msleep(100);
+    }
+    TEST_CHECK(get_output_num() == 2);
+
+    /* Wait for a periodic size refresh to cache the current size */
+    flb_time_msleep(1500);
+
+    /* Read but never process: an unterminated line stays buffered */
+    w_byte = write(ctx->fds[0], partial, strlen(partial));
+    TEST_CHECK(w_byte > 0);
+    fsync(ctx->fds[0]);
+    flb_time_msleep(1500);
+
+    /* copytruncate: empty the file and rewind the writer */
+    ret = ftruncate(ctx->fds[0], 0);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(lseek(ctx->fds[0], 0, SEEK_SET) == 0);
+    w_byte = write(ctx->fds[0], line3, strlen(line3));
+    TEST_CHECK(w_byte > 0);
+    fsync(ctx->fds[0]);
+
+    for (i = 0; i < 100; i++) {
+        if (get_output_num() >= 3) {
+            break;
+        }
+        flb_time_msleep(100);
+    }
+    TEST_CHECK(get_output_num() == 3);
+
+    for (i = 0; i < 100; i++) {
+        files_processed_bytes = get_input_counter_val(ctx->flb, "files_processed_bytes_total");
+        if (files_processed_bytes == (double) expected_processed) {
+            break;
+        }
+        flb_time_msleep(100);
+    }
+    files_abandoned_bytes = get_input_counter_val(ctx->flb, "files_abandoned_bytes_total");
+
+    if (!TEST_CHECK(files_processed_bytes == (double) expected_processed)) {
+        TEST_MSG("files_processed_bytes_total=%f, expected %zu",
+                 files_processed_bytes, expected_processed);
+    }
+    if (!TEST_CHECK(files_abandoned_bytes == (double) expected_abandoned)) {
+        TEST_MSG("files_abandoned_bytes_total=%f, expected %zu",
+                 files_abandoned_bytes, expected_abandoned);
+    }
+
+    test_tail_ctx_destroy(ctx);
+    unlink(file);
+}
 #endif /* _WIN32 */
 
 /* Test list */
@@ -3402,6 +3508,7 @@ TEST_LIST = {
     {"byte_metrics", flb_test_in_tail_byte_metrics},
 #ifndef _WIN32
     {"abandoned_bytes", flb_test_in_tail_abandoned_bytes},
+    {"copytruncate_after_size_refresh", flb_test_in_tail_copytruncate_after_size_refresh},
 #endif
     /* Properties */
     {"skip_long_lines", flb_test_in_tail_skip_long_lines},
